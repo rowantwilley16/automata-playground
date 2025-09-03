@@ -1,183 +1,270 @@
-"""
-Conway's Game of Life — minimal, interactive (Tkinter only)
+import sys, time, random, math
+import numpy as np
+import pygame as pg
 
-Controls:
-  • Left click        : toggle a cell (alive/dead)
-  • Space             : start / pause
-  • S (or s)          : step one generation
-  • R (or r)          : randomize board
-  • C (or c)          : clear board
-  • Q (or q) / Escape : quit
+# ========= Config =========
+GRID_ROWS   = 120
+GRID_COLS   = 120
+CELL_SIZE   = 8            # window pixels per cell (scaled)
+TARGET_FPS  = 60
+WRAP_WORLD  = True         # toroidal world (fastest)
+RANDOM_P    = 0.25
+ALIVE_RGB   = (31, 119, 180)  # "#1f77b4"
+DEAD_RGB    = (17, 17, 17)    # "#111111"
+BG_RGB      = (0, 0, 0)
+SHOW_FPS    = True
+GRID_COLOR  = (80, 80, 80)    # grid line color
+GRID_ALPHA  = 90               # 0-255 transparency
+# =========================
 
-No external dependencies.
-"""
+# --- Vectorized step (wrap/no-wrap) ---
+def step_wrap(g: np.ndarray, out: np.ndarray):
+    n = (
+        np.roll(g,  1, 0) + np.roll(g, -1, 0) +
+        np.roll(g,  1, 1) + np.roll(g, -1, 1) +
+        np.roll(np.roll(g, 1, 0),  1, 1) +
+        np.roll(np.roll(g, 1, 0), -1, 1) +
+        np.roll(np.roll(g,-1, 0),  1, 1) +
+        np.roll(np.roll(g,-1, 0), -1, 1)
+    )
+    out[:] = ((n == 3) | ((g == 1) & ((n == 2) | (n == 3)))).astype(np.uint8)
 
-import random
-import tkinter as tk
+def step_nowrap(g: np.ndarray, out: np.ndarray):
+    rows, cols = g.shape
+    n = np.zeros_like(g, dtype=np.uint8)
+    n[1:,   1:  ] += g[:-1, :-1]
+    n[1:,   :   ] += g[:-1, :  ]
+    n[1:,   :-1 ] += g[:-1, 1: ]
+    n[:,    1:  ] += g[:,   :-1]
+    n[:,    :-1 ] += g[:,   1: ]
+    n[:-1,  1:  ] += g[1:,  :-1]
+    n[:-1,  :   ] += g[1:,  :  ]
+    n[:-1,  :-1 ] += g[1:,  1: ]
+    out[:] = ((n == 3) | ((g == 1) & (n == 2)) | ((g == 1) & (n == 3))).astype(np.uint8)
 
-# ======= Config =======
-CELL_SIZE    = 14       # pixels per cell
-GRID_ROWS    = 40
-GRID_COLS    = 60
-TICK_MS      = 80       # ms between generations while running
-ALIVE_COLOR  = "#1f77b4"
-DEAD_COLOR   = "#1b1b1b"
-GRID_COLOR   = "#2b2b2b"
-BG_COLOR     = "#101010"
-# ======================
-
-class GameOfLife:
-    def __init__(self, rows, cols):
+class Life:
+    def __init__(self, rows, cols, wrap=True):
         self.rows, self.cols = rows, cols
-        self.grid = [[0]*cols for _ in range(rows)]
+        self.wrap = wrap
+        self.g      = np.zeros((rows, cols), dtype=np.uint8)
+        self.next_g = np.zeros_like(self.g)
+        self.step_fn = step_wrap if wrap else step_nowrap
+
+    def randomize(self, p=RANDOM_P):
+        self.g[:] = (np.random.random(self.g.shape) < p).astype(np.uint8)
 
     def clear(self):
-        for r in range(self.rows):
-            for c in range(self.cols):
-                self.grid[r][c] = 0
+        self.g.fill(0)
 
-    def randomize(self, p=0.25):
-        for r in range(self.rows):
-            for c in range(self.cols):
-                self.grid[r][c] = 1 if random.random() < p else 0
-
-    def toggle(self, r, c):
+    def set_cell(self, r, c, val):
         if 0 <= r < self.rows and 0 <= c < self.cols:
-            self.grid[r][c] ^= 1
+            self.g[r, c] = 1 if val else 0
 
-    def _neighbors(self, r, c):
-        n = 0
-        for dr in (-1, 0, 1):
-            for dc in (-1, 0, 1):
-                if dr == 0 and dc == 0:
-                    continue
-                rr = r + dr
-                cc = c + dc
-                if 0 <= rr < self.rows and 0 <= cc < self.cols:
-                    n += self.grid[rr][cc]
-        return n
+    def get_cell(self, r, c):
+        if 0 <= r < self.rows and 0 <= c < self.cols:
+            return int(self.g[r, c])
+        return 0
 
     def step(self):
-        nxt = [[0]*self.cols for _ in range(self.rows)]
-        for r in range(self.rows):
-            for c in range(self.cols):
-                alive = self.grid[r][c] == 1
-                k = self._neighbors(r, c)
-                # Conway's rules
-                if alive and (k == 2 or k == 3):
-                    nxt[r][c] = 1
-                elif not alive and k == 3:
-                    nxt[r][c] = 1
-                else:
-                    nxt[r][c] = 0
-        self.grid = nxt
+        self.step_fn(self.g, self.next_g)
+        self.g, self.next_g = self.next_g, self.g
 
+# -------- Disco helpers --------
+def hsv_to_rgb_np(h, s, v):
+    i = np.floor(h*6).astype(np.int32)
+    f = h*6 - i
+    p = (v*(1-s))
+    q = (v*(1-f*s))
+    t = (v*(1-(1-f)*s))
+    i_mod = (i % 6)
 
-class LifeApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Conway's Game of Life")
-        self.root.configure(bg=BG_COLOR)
+    r = np.choose(i_mod, [v, q, p, p, t, v])
+    g = np.choose(i_mod, [t, v, v, q, p, p])
+    b = np.choose(i_mod, [p, p, t, v, v, q])
+    return (np.clip(r*255,0,255).astype(np.uint8),
+            np.clip(g*255,0,255).astype(np.uint8),
+            np.clip(b*255,0,255).astype(np.uint8))
 
-        self.life = GameOfLife(GRID_ROWS, GRID_COLS)
-        w = GRID_COLS * CELL_SIZE
-        h = GRID_ROWS * CELL_SIZE
+class Disco:
+    OFF=0; HUE=1; RAINBOW=2
 
-        self.canvas = tk.Canvas(
-            root, width=w, height=h, bg=BG_COLOR,
-            highlightthickness=0
-        )
-        self.canvas.pack()
+class Renderer:
+    def __init__(self, cols, rows, cell_size, alive_rgb, dead_rgb):
+        self.cols, self.rows = cols, rows
+        self.cell_size = cell_size
+        self.window_size = (cols*cell_size, rows*cell_size)
+        self.dead = np.array(dead_rgb, dtype=np.uint8)
+        self.alive_rgb = np.array(alive_rgb, dtype=np.uint8)
 
-        # Pre-create rectangles for fast redraw
-        self.rects = [
-            [
-                self.canvas.create_rectangle(
-                    c*CELL_SIZE, r*CELL_SIZE,
-                    (c+1)*CELL_SIZE, (r+1)*CELL_SIZE,
-                    outline=GRID_COLOR, fill=DEAD_COLOR
-                )
-                for c in range(GRID_COLS)
-            ]
-            for r in range(GRID_ROWS)
-        ]
+        xv, yv = np.meshgrid(np.linspace(0,1,cols,endpoint=False),
+                             np.linspace(0,1,rows,endpoint=False))
+        base_h = (xv*2 + yv*3) % 1.0
+        r,g,b = hsv_to_rgb_np(base_h, 1.0, 1.0)
+        self.rainbow_base = np.dstack([r,g,b])  # (H,W,3) uint8
 
-        # State
-        self.running = False
-        self._after_id = None
+        self.small_surf = pg.Surface((cols, rows))
+        self.colors = np.array([dead_rgb, alive_rgb], dtype=np.uint8)
 
-        # Bindings
-        self.canvas.bind("<Button-1>", self.on_click)
-        self.root.bind("<space>", self.on_space)
-        self.root.bind("s", self.on_step); self.root.bind("S", self.on_step)
-        self.root.bind("r", self.on_random); self.root.bind("R", self.on_random)
-        self.root.bind("c", self.on_clear); self.root.bind("C", self.on_clear)
-        self.root.bind("<Escape>", lambda e: self.root.quit())
-        self.root.bind("q", lambda e: self.root.quit())
-        self.root.bind("Q", lambda e: self.root.quit())
+        self.mode = Disco.OFF
+        self._last_alive = self.alive_rgb.copy()
 
-        # First draw
-        self.redraw()
+        # --- pre-rendered GRID SURFACE (fast) ---
+        self.show_grid = True
+        self.grid_surf = self._make_grid_surface(self.window_size, cell_size, GRID_COLOR, GRID_ALPHA)
 
-    def on_click(self, event):
-        r = event.y // CELL_SIZE
-        c = event.x // CELL_SIZE
-        self.life.toggle(r, c)
-        self._color_cell(r, c)
+    def _make_grid_surface(self, window_size, cell_size, color, alpha):
+        w, h = window_size
+        surf = pg.Surface((w, h), flags=pg.SRCALPHA)  # per-pixel alpha
+        surf.fill((0,0,0,0))
+        rgba = (*color, alpha)
+        # vertical lines
+        for x in range(0, w+1, cell_size):
+            pg.draw.line(surf, rgba, (x, 0), (x, h))
+        # horizontal lines
+        for y in range(0, h+1, cell_size):
+            pg.draw.line(surf, rgba, (0, y), (w, y))
+        return surf
 
-    def on_space(self, _):
-        if self.running:
-            self.pause()
+    def toggle_mode(self):
+        self.mode = (self.mode + 1) % 3
+
+    def toggle_grid(self):
+        self.show_grid = not self.show_grid
+
+    def _alive_color_for_frame(self):
+        if self.mode == Disco.OFF:
+            return self.alive_rgb
+        elif self.mode == Disco.HUE:
+            t = pg.time.get_ticks() * 0.00025
+            h = (t % 1.0)
+            r,g,b = hsv_to_rgb_np(np.array(h), 1.0, 1.0)
+            return np.array([int(r), int(g), int(b)], dtype=np.uint8)
         else:
-            self.run()
+            return None
 
-    def on_step(self, _):
-        if not self.running:
-            self.life.step()
-            self.redraw()
+    def draw(self, screen, grid_u8):
+        if self.mode in (Disco.OFF, Disco.HUE):
+            alive = self._alive_color_for_frame()
+            if alive is None:
+                alive = self.alive_rgb
+            if not np.array_equal(alive, self._last_alive):
+                self.colors[1] = alive
+                self._last_alive = alive
+            rgb = self.colors[grid_u8]  # (H,W,3)
+        else:
+            t = pg.time.get_ticks() * 0.001
+            shift = int((t*60) % self.cols)
+            shifted = np.roll(self.rainbow_base, shift, axis=1)
+            rgb = np.where(grid_u8[...,None] == 1, shifted, self.dead)
 
-    def on_random(self, _):
-        if not self.running:
-            self.life.randomize()
-            self.redraw()
+        pg.surfarray.blit_array(self.small_surf, rgb.swapaxes(0,1))
+        frame = pg.transform.scale(self.small_surf, self.window_size)
+        screen.blit(frame, (0,0))
 
-    def on_clear(self, _):
-        if not self.running:
-            self.life.clear()
-            self.redraw()
+        # draw the grid overlay (cheap blit)
+        if self.show_grid:
+            screen.blit(self.grid_surf, (0,0))
 
-    def _tick(self):
-        self.life.step()
-        self.redraw()
-        if self.running:
-            self._after_id = self.root.after(TICK_MS, self._tick)
+def mouse_to_rc(pos):
+    x, y = pos
+    c = x // CELL_SIZE
+    r = y // CELL_SIZE
+    r = max(0, min(GRID_ROWS-1, r))
+    c = max(0, min(GRID_COLS-1, c))
+    return r, c
 
-    def run(self):
-        if not self.running:
-            self.running = True
-            self._tick()
+def main():
+    pg.init()
+    clock = pg.time.Clock()
+    font  = pg.font.SysFont(None, 22)
 
-    def pause(self):
-        self.running = False
-        if self._after_id is not None:
-            self.root.after_cancel(self._after_id)
-            self._after_id = None
+    life = Life(GRID_ROWS, GRID_COLS, wrap=WRAP_WORLD)
+    renderer = Renderer(GRID_COLS, GRID_ROWS, CELL_SIZE, ALIVE_RGB, DEAD_RGB)
 
-    def _color_cell(self, r, c):
-        fill = ALIVE_COLOR if self.life.grid[r][c] else DEAD_COLOR
-        self.canvas.itemconfig(self.rects[r][c], fill=fill)
+    screen = pg.display.set_mode(renderer.window_size)
+    pg.display.set_caption("Conway's Game of Life — Pygame (Disco + Grid)")
 
-    def redraw(self):
-        # Minimal redraw: recolor all; still fast enough for moderate grids
-        for r in range(GRID_ROWS):
-            row = self.life.grid[r]
-            for c in range(GRID_COLS):
-                self.canvas.itemconfig(
-                    self.rects[r][c],
-                    fill=(ALIVE_COLOR if row[c] else DEAD_COLOR)
+    running = False
+    dragging = False
+    paint_val = 1
+    last_rc = (-1, -1)
+    fps_accum_time = 0.0
+    fps_accum_frames = 0
+
+    while True:
+        # --- Input ---
+        for event in pg.event.get():
+            if event.type == pg.QUIT:
+                pg.quit(); sys.exit(0)
+            elif event.type == pg.KEYDOWN:
+                if event.key == pg.K_ESCAPE or event.key == pg.K_q:
+                    pg.quit(); sys.exit(0)
+                elif event.key == pg.K_SPACE:
+                    running = not running
+                elif event.key == pg.K_s:
+                    if not running: life.step()
+                elif event.key == pg.K_r:
+                    if not running: life.randomize()
+                elif event.key == pg.K_c:
+                    if not running: life.clear()
+                elif event.key == pg.K_w:
+                    life.wrap = not life.wrap
+                    life.step_fn = step_wrap if life.wrap else step_nowrap
+                elif event.key == pg.K_d:
+                    renderer.toggle_mode()   # disco 🪩
+                elif event.key == pg.K_g:
+                    renderer.toggle_grid()   # grid toggle
+            elif event.type == pg.MOUSEBUTTONDOWN and event.button == 1:
+                dragging = True
+                r, c = mouse_to_rc(pg.mouse.get_pos())
+                paint_val = 0 if life.get_cell(r, c) else 1
+                last_rc = (-1, -1)
+                life.set_cell(r, c, paint_val)
+            elif event.type == pg.MOUSEBUTTONUP and event.button == 1:
+                dragging = False
+                last_rc = (-1, -1)
+            elif event.type == pg.MOUSEMOTION and dragging and not running:
+                r, c = mouse_to_rc(event.pos)
+                if (r, c) != last_rc:
+                    life.set_cell(r, c, paint_val)
+                    last_rc = (r, c)
+
+        # --- Update ---
+        if running:
+            life.step()
+
+        # --- Render ---
+        renderer.draw(screen, life.g)
+
+        # On-screen FPS & status
+        if SHOW_FPS:
+            fps_accum_time += clock.get_time() / 1000.0
+            fps_accum_frames += 1
+            if fps_accum_time >= 1.0:
+                fps_value = fps_accum_frames / fps_accum_time
+                pg.display.set_caption(
+                    f"Life — Pygame | {'RUN' if running else 'PAUSE'} | "
+                    f"{'WRAP' if life.wrap else 'CLAMP'} | "
+                    f"Mode: {['OFF','HUE','RAINBOW'][renderer.mode]} | "
+                    f"Grid: {'ON' if renderer.show_grid else 'OFF'} | "
+                    f"FPS: {fps_value:.1f}"
                 )
+                fps_accum_time = 0.0
+                fps_accum_frames = 0
+
+            text = font.render(
+                f"{'RUN' if running else 'PAUSE'} | "
+                f"{'WRAP' if life.wrap else 'CLAMP'} | "
+                f"Mode: {['OFF','HUE','RAINBOW'][renderer.mode]} | "
+                f"Grid: {'ON' if renderer.show_grid else 'OFF'} | "
+                f"{GRID_COLS}x{GRID_ROWS}@{CELL_SIZE}px | "
+                f"Target {TARGET_FPS} FPS",
+                True, (230, 230, 230)
+            )
+            screen.blit(text, (8, 8))
+
+        pg.display.flip()
+        clock.tick(TARGET_FPS)
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = LifeApp(root)
-    root.mainloop()
+    main()
